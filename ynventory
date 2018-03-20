@@ -1,0 +1,674 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+# Copyright 2018 critter bvba
+
+"""
+This file is part of ynventory.
+
+ynventory is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+ynventory is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with ynventory.  If not, see <http://www.gnu.org/licenses/>.
+"""
+
+# Author: William Leemans <willie@elaba.net>
+
+import os
+import re
+import sys
+import copy
+import json
+import time
+import yaml
+import datetime
+import ConfigParser
+from pwd import getpwuid
+from grp import getgrgid
+from optparse import OptionParser,OptionGroup
+from jinja2 import Template
+
+VERBOSE = False
+def main():
+    global VERBOSE
+    config = None
+    args = parse_arguments()
+    VERBOSE = args.verbose
+    for configfile in [ os.getenv('YNVENTORY_CONFIG_FILE', '/etc/ynventory/ynventory.conf'), '~/.ynventory.conf' ]:
+        if os.path.isfile(os.path.expanduser(configfile)):
+            config = load_config("./test.conf")
+            break
+    if config is None:
+        logMessage('warning', "Couldn't find a config file, using defaults.")
+        config = load_config(None)
+    
+    if args.check_syntax:
+        check_syntax(config)
+        sys.exit(0)
+
+    if args.cache_refresh:
+        refresh_cache(config)
+        sys.exit(0)
+
+    if args.cache_info:
+        show_cache_info(config)
+        sys.exit(0)
+
+    if args.query_hosts:
+        query_hosts(config, args)
+        sys.exit(0)
+
+    if args.query_groups:
+        query_groups(config, args)
+        sys.exit(0)
+
+    if args.ansible_list:
+        show_ansible_inventory(config)
+        sys.exit(0)
+
+    if args.ansible_host is not None:
+        show_ansible_host(config, args)
+        sys.exit(0)
+
+    logMessage('error','Muppet alert!')
+    sys.exit(1)
+
+def check_syntax( config ):
+    include_hosts_path = []
+    include_groups_path = []
+    for path in config['path']['hosts']:
+        if not os.path.isdir(path):
+            logMessage('error', 'Could not find %s.' % path)
+        elif not os.access(path, os.R_OK):
+            logMessage('error', 'Cannot read the contents of %s.' % path)
+        else:
+            include_hosts_path.append(path)
+
+    for path in config['path']['groups']:
+        if not os.path.isdir(path):
+            logMessage('error', 'Could not find %s.' % path)
+        elif not os.access(path, os.R_OK):
+            logMessage('error', 'Cannot read the contents of %s.' % path)
+        else:
+            include_groups_path.append(path)
+
+    logMessage('verbose', 'Checking host files')
+    for path in get_yaml_filelist(include_hosts_path, reverse=False):
+        with open(path,'r') as f:
+            try:
+                yml = yaml.load(f)
+                logMessage('verbose', '%s is structurally sound.' % path )
+            except:
+                logMessage("warning", "There is a structural YAML error in file %s." % path )
+                yml = {}
+
+        for el in yml.keys():
+            if isinstance(yml[el], dict):
+                logMessage("verbose", "%s:%s is correct and contains %s facts." % (path, el, len(yml[el].keys())) )
+            else:
+                logMessage("error", "%s:%s is not a dict!" % (path, el) )
+
+    logMessage('verbose', 'Checking group files')
+    for path in get_yaml_filelist(include_groups_path, reverse=False):
+        with open(path,'r') as f:
+            try:
+                yml = yaml.load(f)
+                logMessage('verbose', '%s is structurally sound.' % path )
+            except:
+                logMessage("warning", "There is a structural YAML error in file %s." % path )
+                yml = {}
+
+        for el in yml.keys():
+            if isinstance(yml[el], dict):
+                logMessage("verbose", "%s:%s is correct" % (path, el) )
+
+                if 'children' in yml[el].keys():
+                    if isinstance(yml[el]['children'],list):
+                        logMessage("verbose", "%s:%s has %s children." % (path, el, len(yml[el]['children']))) 
+                if 'hosts' in yml[el].keys():
+                    if isinstance(yml[el]['hosts'],list):
+                        logMessage("verbose", "%s:%s has %s hosts." % (path, el, len(yml[el]['hosts']))) 
+                if 'vars' in yml[el].keys():
+                    if isinstance(yml[el]['vars'],dict):
+                        logMessage("verbose", "%s:%s has %s facts." % (path, el, len(yml[el]['vars'].keys()))) 
+                for o in yml[el].keys():
+                    if o not in [ 'hosts', 'children', 'vars' ]:
+                        logMessage('warning', '%s:%s contains un unrecognised option: %s.' % (path, el, o) )
+            else:
+                logMessage("error", "%s:%s is not a dict!" % (path, el) )
+
+
+def refresh_cache( config=None ):
+    for path in config['path']['hosts']:
+        if not os.path.isdir(path):
+            logMessage('error', 'Could not find %s. Please make sure it exists.' % path)
+            sys.exit(1)
+        if not os.access(path, os.R_OK):
+            logMessage('error', 'Cannot read the contents of %s.' % path)
+            sys.exit(1)
+    
+    for path in config['path']['groups']:
+        if not os.path.isdir(path):
+            logMessage('error', 'Could not find %s. Please make sure it exists.' % path)
+            sys.exit(1)
+        if not os.access(path, os.R_OK):
+            logMessage('error', 'Cannot read the contents of %s.' % path)
+            sys.exit(1)
+    
+    hostvars = {}
+    for path in get_yaml_filelist( config['path']['hosts'] ):
+        with open(path, 'r') as f:
+            if not os.access(path, os.R_OK):
+                logMessage('warning', "Couldn't read %s. Skipping." % path)
+            else:
+                try:
+                    hostvars = merge_dicts_recursively(hostvars, yaml.load(f))
+                except:
+                    logMessage('warning', 'An error ocurred loading %s. Skipping.' % path)
+
+    groupvars = {}
+    for path in get_yaml_filelist( config['path']['groups'] ):
+        if not os.access(path, os.R_OK):
+            logMessage('warning', "Couldn't read %s. Skipping." % path)
+        else:
+            with open(path, 'r') as f:
+                try:
+                    rawgroupvars = yaml.load(f)
+                except:
+                    logMessage('warning', 'An error ocurred loading %s. Skipping.' % path)
+                    continue
+               
+                groupvars = merge_groups(groupvars, rawgroupvars, hostvars)
+
+    inventory = groupvars.copy()
+    inventory.update({ '_meta': { 'hostvars': hostvars } })
+
+    save_cache( config['path']['cache'], inventory)
+    return {}
+
+def merge_groups( groupvars, rawgroupvars, hostvars ):
+    tmp_groupvars = {}
+    for hostname in hostvars:
+        h = hostvars[hostname].copy()
+        h.update({'inventory_hostname': hostname})
+
+        for groupname in rawgroupvars:
+            dynamic = False
+            if 'when' in rawgroupvars[groupname].keys():
+                t = Template(rawgroupvars[rgroupname]['when'])
+                rwhen = t.render(h)
+                dynamic = True
+            else:
+                rwhen = 'True'
+
+            if not eval(rwhen, h.copy()):
+                continue
+
+            t = Template(groupname)
+            rgroupname = t.render(h).encode('utf-8')
+            if rgroupname != groupname:
+                dynamic = True
+            
+            if rgroupname not in tmp_groupvars.keys():
+                tmp_groupvars.update({ rgroupname: {} })
+
+            if 'children' in rawgroupvars[groupname].keys():
+                t = Template(yaml.dump(rawgroupvars[groupname]['children']))
+                rchildren = yaml.load(t.render(h))
+            
+                if 'children' not in tmp_groupvars[groupname].keys():
+                    tmp_groupvars[rgroupname].update({ 'children': [] })
+                for child in rchildren:
+                    if child not in tmp_groupvars[rgroupname]['children']:
+                        tmp_groupvars[rgroupname]['children'].append(child)
+
+                if yaml.dump(rawgroupvars[groupname]['children']) != yaml.dump(rchildren):
+                    dynamic = True
+
+            if 'hosts' not in rawgroupvars[groupname].keys():
+                if 'hosts' not in tmp_groupvars[rgroupname].keys():
+                    tmp_groupvars[rgroupname].update({ 'hosts': [] })
+                if hostname not in tmp_groupvars[rgroupname]['hosts']:
+                    tmp_groupvars[rgroupname]['hosts'].append(hostname)
+            else:
+                if 'hosts' not in tmp_groupvars[rgroupname].keys():
+                    tmp_groupvars[rgroupname].update({ 'hosts': [] })
+                for m in rawgroupvars[groupname]['hosts']:
+                    if m not in tmp_groupvars[rgroupname]['hosts'] and m in hostvars.keys():
+                        tmp_groupvars[rgroupname]['hosts'].append(m)
+
+            if 'vars' in rawgroupvars[groupname].keys():
+                if 'vars' not in tmp_groupvars[rgroupname].keys():
+                    tmp_groupvars[rgroupname]['vars'] = {}
+                tmp_groupvars[rgroupname]['vars'].update(rawgroupvars[groupname]['vars'])
+            
+            groupvars.update(tmp_groupvars)
+
+            for g in tmp_groupvars:
+                if 'children' in tmp_groupvars[g].keys():
+                    if len(tmp_groupvars[g]['children']) == 0:
+                        del tmp_groupvars[g]['children']
+                    else:
+                        tmp_groupvars[g]['children'].sort()
+
+                if 'hosts' in tmp_groupvars[g].keys():
+                    if len(tmp_groupvars[g]['hosts']) == 0:
+                        del tmp_groupvars[g]['hosts']
+                    else:
+                        tmp_groupvars[g]['hosts'].sort()
+                if 'varss' in tmp_groupvars[g].keys():
+                    if len(tmp_groupvars[g]['vars'].keys()) == 0:
+                        del tmp_groupvars[g]['vars']
+
+    return groupvars
+
+def show_cache_info( config=None ):
+    path_link = '%s/latest.yml' % config['path']['cache']
+    path_real = os.path.realpath(path_link)
+    if config['path']['config'] is not None:
+        logMessage('info', 'Config file       : %s' % config['path']['config'])
+    else:
+        logMessage('info', 'Config file       : none detected')
+    logMessage('info', 'Cache file        : %s' % path_real)
+    if os.path.isfile(path_real) and os.access(path_real, os.R_OK):
+        logMessage('info', 'Cache create time : %s' % time.ctime(os.path.getctime(path_real)))
+        logMessage('info', 'Cache modify time : %s' % time.ctime(os.path.getmtime(path_real)))
+        logMessage('info', 'Cache filesize    : %s' % size2human(os.path.getsize(path_real)))
+        logMessage('info', 'Cache owner       : %s' % getpwuid(os.stat(path_real).st_uid).pw_name)
+        logMessage('info', 'Cache owner       : %s' % getgrgid(os.stat(path_real).st_gid).gr_name)
+        logMessage('info', 'Cache permission  : %s' % oct(os.stat(path_real).st_mode & 0777))
+
+        cache = load_cache( config['path']['cache'] )
+        hostcache = cache['_meta']['hostvars'].copy()
+        groupcache = cache.copy()
+        del groupcache['_meta']
+
+        logMessage('info', 'Cache hostcount   : %s' % len(hostcache.keys()))
+        logMessage('info', 'Cache groupcount  : %s' % len(groupcache.keys()))
+    elif not os.path.isfile(path_real):
+        logMessage('error', '%s could not be found.' % path_real)
+    elif not os.access(path_real, os.R_OK):
+        logMessage('error', '%s could not be read.' % path_real)
+
+    return {}
+
+def size2human( size ):
+    suffixes = ['B', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB', 'ZB', 'YB' ]
+    if size == 0: return '0 B'
+    size = float(size)
+    i = 0
+    while size >= 1024 and i < len(suffixes) - 1:
+        size = size /1024
+        i = i + 1
+    f = ('%.2f' % size).rstrip('0').rstrip('.')
+    return '%s %s' % (f, suffixes[i])
+
+def query_hosts( config=None, args=None ):
+    cache = load_cache( config['path']['cache'] )
+    hostcache = cache['_meta']['hostvars'].copy()
+    groupcache = cache.copy()
+    del groupcache['_meta']
+
+    hostfilter = re.compile( args.query_hosts, re.IGNORECASE )
+    tlist = filter( hostfilter.search, hostcache )
+    tlist.sort()
+    hostlist = []
+
+    for host in tlist:
+        # --condition
+        t = cache['_meta']['hostvars'][host].copy()
+        t.update({'inventory_hostname':host})
+        try:
+            ev = eval(args.query_condition, t)
+        except: 
+            ev = False
+
+        # --member-of
+        glist = []
+        groupfilter = re.compile( args.query_host_memberof, re.IGNORECASE )
+        for group in filter(groupfilter.search, groupcache):
+            if 'hosts' in groupcache[group].keys():
+                hostfilter = re.compile( host, re.IGNORECASE )
+                if len(filter(hostfilter.search, cache[group]['hosts'])) > 0:
+                    glist.append(group)
+        if ev and ( args.query_host_memberof == '.' or len(glist) > 0):
+            hostlist.append(host)
+
+    if args.query_output_format is None:
+        if args.query_format is None:
+            args.query_format = '{{ inventory_hostname }}'
+        for host in hostlist:
+            t = hostcache[host].copy()
+            t.update({'inventory_hostname':host})
+            out = Template(args.query_format)
+            print out.render(t)
+
+    elif args.query_output_format in [ 'yml', 'yaml', 'json' ]:
+        printlist = {}
+        for host in hostlist:
+            grouplist = group_membership(host, groupcache)
+            for group in grouplist:
+                grouplist = grouplist + group_child(group, groupcache, True)
+            grouplist.sort()
+            groupvars = {}
+
+            for group in grouplist:
+                if 'vars' in groupcache[group]:
+                    t = groupcache[group]['vars']
+                else:
+                    t = {}
+                groupvars.update({ group: t})
+
+
+            printlist.update({ host: { 'HOSTVARS': hostcache[host],
+                                       'GROUPVARS': groupvars }})
+            
+        if args.query_output_format == 'json':
+            print json.dumps(printlist)
+        else:
+            print yaml.dump(printlist, default_flow_style = False)
+
+    else:
+        logMessage('error', '%s is an unknown output format.' % args.query_output_format)
+        sys.exit(1)
+
+def query_groups( config=None, args=None ):
+    cache = load_cache( config['path']['cache'] )
+    del cache['_meta']
+    groupfilter = re.compile( args.query_groups, re.IGNORECASE )
+    tlist = filter( groupfilter.search, cache )
+    tlist.sort()
+    grouplist = []
+
+    for group in tlist:
+        # --condition
+        if 'vars' in cache[group]:
+            t = cache[group]['vars'].copy()
+        else:
+            t = {}
+        t.update({ 'inventory_groupname': group })
+        try:
+            ev = eval(args.query_condition, t)
+        except:
+            ev = False
+        
+        #--member-host
+        hlist = []
+        if args.query_group_host != '.':
+            if 'hosts' in cache[group].keys():
+                hostfilter = re.compile( args.query_group_host, re.IGNORECASE )
+                hlist = filter(hostfilter.search, cache[group]['hosts'])
+
+        #--member-child
+        glist = []
+        if args.query_group_child != '.':
+            if 'children' in cache[group].keys():
+                groupfilter = re.compile( args.query_group_child, re.IGNORECASE )
+                glist = filter(groupfilter.search, cache[group]['children'])
+
+        if ev and ( args.query_group_host == '.' or len(hlist) > 0) and (args.query_group_child == '.' or len(glist) > 0):
+            grouplist.append(group)
+
+    if args.query_output_format is None:
+        if args.query_format is None:
+            args.query_format = '{{ inventory_groupname }}'
+        for group in grouplist:
+            if 'vars' not in cache[group]:
+                t = { }
+            else:
+                t = cache[group]['vars'].copy()
+            t.update({ 'inventory_groupname': group })
+            out = Template(args.query_format)
+            print out.render(t)
+    elif args.query_output_format in [ 'yml', 'yaml' ]:
+        printlist = {}
+        for group in grouplist:
+            printlist.update({ group: cache[group] })
+
+        print yaml.dump(printlist, default_flow_style = False)
+
+    elif args.query_output_format == 'json':
+        printlist = {}
+        for group in grouplist:
+            printlist.update({ group: cache[group]})
+
+        print json.dumps(printlist)
+
+    else:
+        logMessage('error', '%s is an unknown output format.' % args.query_output_format)
+        sys.exit(1)
+
+    return {}
+
+def show_ansible_inventory( config ):
+    cache = load_cache( config['path']['cache'] )
+    print json.dumps(cache)
+    return True
+
+def show_ansible_host( config, args ):
+    cache = load_cache( config['path']['cache'] )
+    if args.ansible_host in cache['_meta']['hostvars'].keys():
+        print json.dumps(cache['_meta']['hostvars'][args.ansible_host])
+    else:
+        print json.dumps({})
+
+    return True
+
+def group_membership( host, cache ):
+    result = []
+    for group in cache.keys():
+        if 'hosts' in cache[group].keys() and host in cache[group]['hosts']:
+            result.append(group)
+    
+    return result
+
+def group_child( group, cache, recurse=False ):
+    result = []
+    for g in cache.keys():
+        if 'children' in cache[g].keys() and group in cache[g]['children']:
+             result.append(g)
+             if recurse:
+                 result = result + group_child( g, cache, recurse)
+    return result
+
+def parse_arguments():
+    parser = OptionParser()
+    g_global = OptionGroup(parser, "Global options")
+    g_global.add_option("--verbose", "-v", dest="verbose", default=False, action="store_true", help="Provide verbose feedback")
+    g_global.add_option("--check-syntax",  dest="check_syntax", default=False, action="store_true", help="Check the syntax of the yaml files")
+
+    g_cache = OptionGroup(parser, "Cache options", "Use these options to manage the cache")
+    g_cache.add_option("--refresh-cache", "-R", dest="cache_refresh", default=False, action="store_true", help="Refresh the ynventory cache")
+    g_cache.add_option("--cache-info", "-I", dest="cache_info", default=False, action="store_true", help="Get information about the ynventory cache")
+
+    g_query = OptionGroup(parser, "Global query options")
+    g_query.add_option("--query-hosts", "-H", dest="query_hosts", default=None, help="Query the hosts")
+    g_query.add_option("--query-groups", "-G", dest="query_groups", default=None, help="Query the groups")
+    g_query.add_option("--output-format", "-o", dest="query_output_format", default=None, help="Output as json or yaml")
+    g_query.add_option("--condition", "-c", dest="query_condition", default='True', help="python condition to apply to result")
+    g_query.add_option("--format", "-f", dest="query_format", default=None, help="Format the text output using jinja2")
+   
+    g_query_hosts = OptionGroup(parser, "Hosts query options")
+    g_query_hosts.add_option("--member-of", dest="query_host_memberof", default='.', help="List hosts which are member of this group")
+   
+    g_query_groups = OptionGroup(parser, "Groups query options")
+    g_query_groups.add_option("--member-host", dest="query_group_host", default=".", help="List groups containing the specified host")
+    g_query_groups.add_option("--member-child", dest="query_group_child", default=".", help="List groups containing the specified group")
+
+    g_query_ansible = OptionGroup(parser, "Ansible query options", "Options to be compatible with ansible")
+    g_query_ansible.add_option("--list", dest="ansible_list", default=False, action="store_true", help="List the inventory in JSON format")
+    g_query_ansible.add_option("--host", dest="ansible_host", default=None, help="List the inventory in JSON format for one host")
+
+    parser.add_option_group(g_global)
+    parser.add_option_group(g_cache)
+    parser.add_option_group(g_query)
+    parser.add_option_group(g_query_hosts)
+    parser.add_option_group(g_query_groups)
+    parser.add_option_group(g_query_ansible)
+
+    (options, args) = parser.parse_args()
+    if [ options.check_syntax, options.cache_refresh, options.cache_info, options.query_hosts is not None, options.query_groups is not None, options.ansible_list, options.ansible_host is not None ].count(True) != 1:
+        parser.error("--check-syntax, --refresh-cache, --cache-info, --query-hosts, --query-groups, --list and --host are mutally exclusive. Please select only one.")
+
+    return options
+
+def logMessage( severity, message ):
+    if severity == 'info':
+        print outputcolors.LOG_OK + message + outputcolors.RESET
+    elif severity == 'debug':
+        print outputcolors.LOG_DEBUG + message + outputcolors.RESET
+    elif severity == 'verbose' and VERBOSE:
+        print outputcolors.LOG_VERBOSE + message + outputcolors.RESET
+    elif severity == 'warning':
+        print >> sys.stderr, outputcolors.LOG_WARN + message + outputcolors.RESET
+    elif severity == 'error':
+        print >> sys.stderr, outputcolors.LOG_ERROR + message + outputcolors.RESET
+
+def get_yaml_filelist(paths, reverse=True):
+    """
+    get a list of all yamls files in a list of directories
+    and their subdirectories and return them reverse sorted alfanumerically
+    """
+    result = []
+
+    if not isinstance(paths, list) and not isinstance(paths, tuple):
+        paths = list(paths)
+
+    for path in paths:
+        for root, dirs, files in os.walk(path):
+            for filename in files:
+                if os.path.splitext(filename)[-1] == '.yml':
+                    result.append(os.path.join(root,filename))
+    if reverse:
+        return list(reversed(sorted(result)))
+    else:
+        return sorted(result)
+
+
+def merge_dicts_recursively(*dicts):
+    """
+    merge dicts, without losing information 
+    and retuen a single dict
+    """
+    result = dict()
+    for dictionary in dicts:
+        for dkey in dictionary.keys():
+            if dkey not in result.keys() or not isinstance(dictionary[dkey],dict):
+                result[dkey] = dictionary[dkey]
+            else:
+                result[dkey] = merge_dicts_recursively(result[dkey], dictionary[dkey])
+
+    return result
+
+def save_cache( dirpath, inventory ):
+    timestamp = datetime.datetime.fromtimestamp(time.time()).strftime("%Y%m%d%H%M%S")
+
+    logMessage('verbose', 'Saving %s/ynventory-%s.json' % (dirpath, timestamp))
+    if not os.path.isdir(dirpath):
+        logMessage('error', 'Could not find %s. Please make sure it exists.' % dirpath)
+        sys.exit(1)
+
+    if not os.access(dirpath, os.R_OK):
+        logMessage('error', 'Cannot read the contents of %s.' % dirpath)
+        sys.exit(1)
+
+    if not os.access(dirpath, os.W_OK):
+        logMessage('error', 'Cannot write to %s.' % dirpath)
+        sys.exit(1)
+
+    starttime = time.time()
+    with open('%s/ynventory-%s.json' % ( dirpath, timestamp), 'w') as f:
+        json.dump( inventory, f )
+    endtime = time.time()
+    logMessage('verbose', '%s/ynventory-%s.json was saved in %s sec.' % (dirpath, timestamp, endtime - starttime) )
+
+    if os.path.isfile( '%s/latest.json' % dirpath ):
+        os.unlink( '%s/latest.json' % dirpath )
+
+    os.symlink( 'ynventory-%s.json' % timestamp, '%s/latest.json' % dirpath )
+    logMessage('verbose', 'latest.json symlinked to ynventory-%s.json' % timestamp)
+
+def load_cache( dirpath ):
+    cache = None
+    filepath = '%s/latest.json' % dirpath
+    logMessage('verbose', 'Reading %s.' % filepath)
+    if not os.path.isfile(filepath):
+        logMessage("error", "%s could not be found." % filepath)
+        sys.exit(1)
+    elif os.path.isfile(filepath) and not os.access(filepath, os.R_OK):
+        logMessage("error", "%s cannot be read." % filepath)
+        sys.exit(1)
+    else:
+        starttime = time.time()
+        with open(filepath, 'r') as f:
+            cache = json.load(f)
+        endtime = time.time()
+        logMessage('verbose', '%s loaded in %s sec.' % (filepath, endtime - starttime) )
+    if cache is None:
+        logMessage('warning', '%s is empty.' % filepath)
+        cache = {}
+
+    return cache
+
+def load_config( filepath = None ):
+    config = dict()
+    default = dict(
+            path = dict(
+                config = filepath,
+                hosts = [ '/var/lib/ynventory/hosts' ],
+                groups = [ '/var/lib/ynventory/groups' ],
+                cache = '/var/lib/ynventory/cache',
+                include_home = False,
+                hosts_home = '.ynventory/hosts',
+                groups_home = '.ynventory/groups' ),
+            defaults = dict(
+                localhost_connection = 'local',
+                create_all = False )
+            )
+    if filepath is not None:
+        logMessage('verbose', 'Reading %s.' % filepath)
+        if not os.path.isfile(filepath):
+            logMessage("error", "%s could not be found." % filepath)
+            sys.exit(1)
+        elif os.path.isfile(filepath) and not os.access(filepath, os.R_OK):
+            logMessage("error", "%s cannot be read." % filepath)
+            sys.exit(1)
+        else:
+            starttime = time.time()
+            with open(filepath, 'r') as f:
+                configs = yaml.load(f)
+            endtime = time.time()
+            logMessage('verbose', '%s loaded in %s sec.' % (filepath, endtime - starttime) )
+
+        if configs is None:
+            logMessage('warning', '%s is empty.' % filepath)
+            configs = {}
+        
+        for c in configs.keys():
+            logMessage('verbose', 'Found %s config' % c)
+            if os.getenv('YNVENTORY_CONFIG', 'default') == c:
+                config = configs[c]
+                logMessage('verbose', '%s is used.' % c)
+    else:
+        logMessage('verbose', 'No config file specified. Using default settings')
+
+    return merge_dicts_recursively(default, config)
+
+class outputcolors:
+    LOG_OK      = '\033[0m'
+    LOG_DEBUG   = '\033[34m'
+    LOG_VERBOSE = '\033[34m'
+    LOG_WARN    = '\033[32m'
+    LOG_ERROR   = '\033[31m'
+    RESET       = '\033[0m'
+
+if __name__ == '__main__':
+    main()
