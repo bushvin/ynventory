@@ -44,7 +44,7 @@ def main():
     VERBOSE = args.verbose
     for configfile in [ os.getenv('YNVENTORY_CONFIG_FILE', '/etc/ynventory/ynventory.conf'), '~/.ynventory.conf' ]:
         if os.path.isfile(os.path.expanduser(configfile)):
-            config = load_config("./test.conf")
+            config = load_config(os.path.expanduser(configfile))
             break
     if config is None:
         logMessage('warning', "Couldn't find a config file, using defaults.")
@@ -271,7 +271,7 @@ def merge_groups( groupvars, rawgroupvars, hostvars ):
     return groupvars
 
 def show_cache_info( config=None ):
-    path_link = '%s/latest.yml' % config['path']['cache']
+    path_link = '%s/ynventory-latest.json' % config['path']['cache']
     path_real = os.path.realpath(path_link)
     if config['path']['config'] is not None:
         logMessage('info', 'Config file       : %s' % config['path']['config'])
@@ -313,6 +313,8 @@ def size2human( size ):
 
 def query_hosts( config=None, args=None ):
     cache = load_cache( config['path']['cache'] )
+    if config['path']['include_home']:
+        cache = merge_home( cache, config['path']['hosts_home'], config['path']['groups_home'])
     hostcache = cache['_meta']['hostvars'].copy()
     groupcache = cache.copy()
     del groupcache['_meta']
@@ -374,7 +376,7 @@ def query_hosts( config=None, args=None ):
         if args.query_output_format == 'json':
             print json.dumps(printlist)
         else:
-            print yaml.dump(printlist, default_flow_style = False)
+            print yaml.safe_dump(printlist, encoding = 'utf-8', allow_unicode = True, default_flow_style = False, indent = 4 )
 
     else:
         logMessage('error', '%s is an unknown output format.' % args.query_output_format)
@@ -382,6 +384,8 @@ def query_hosts( config=None, args=None ):
 
 def query_groups( config=None, args=None ):
     cache = load_cache( config['path']['cache'] )
+    if config['path']['include_home']:
+        cache = merge_home( cache, config['path']['hosts_home'], config['path']['groups_home'])
     del cache['_meta']
     groupfilter = re.compile( args.query_groups, re.IGNORECASE )
     tlist = filter( groupfilter.search, cache )
@@ -433,7 +437,7 @@ def query_groups( config=None, args=None ):
         for group in grouplist:
             printlist.update({ group: cache[group] })
 
-        print yaml.dump(printlist, default_flow_style = False)
+        print yaml.safe_dump(printlist, encoding = 'utf-8', allow_unicode = True, default_flow_style = False, indent = 4 )
 
     elif args.query_output_format == 'json':
         printlist = {}
@@ -450,11 +454,15 @@ def query_groups( config=None, args=None ):
 
 def show_ansible_inventory( config ):
     cache = load_cache( config['path']['cache'] )
+    if config['path']['include']:
+        cache = merge_home( cache, config['path']['hosts_home'], config['path']['groups_home'])
     print json.dumps(cache)
     return True
 
 def show_ansible_host( config, args ):
     cache = load_cache( config['path']['cache'] )
+    if config['path']['include']:
+        cache = merge_home( cache, config['path']['hosts_home'], config['path']['groups_home'])
     if args.ansible_host in cache['_meta']['hostvars'].keys():
         print json.dumps(cache['_meta']['hostvars'][args.ansible_host])
     else:
@@ -543,6 +551,12 @@ def get_yaml_filelist(paths, reverse=True):
         paths = list(paths)
 
     for path in paths:
+        if not os.path.isdir(path):
+            logMessage('warning', "%s doesn't exist" % path)
+            continue
+        if not os.access(path, os.R_OK):
+            logMessage('warning', "%s cannot be read" % path)
+            continue
         for root, dirs, files in os.walk(path):
             for filename in files:
                 if os.path.splitext(filename)[-1] == '.yml':
@@ -590,15 +604,15 @@ def save_cache( dirpath, inventory ):
     endtime = time.time()
     logMessage('verbose', '%s/ynventory-%s.json was saved in %s sec.' % (dirpath, timestamp, endtime - starttime) )
 
-    if os.path.isfile( '%s/latest.json' % dirpath ):
-        os.unlink( '%s/latest.json' % dirpath )
+    if os.path.isfile( '%s/ynventory-latest.json' % dirpath ):
+        os.unlink( '%s/ynventory-latest.json' % dirpath )
 
-    os.symlink( 'ynventory-%s.json' % timestamp, '%s/latest.json' % dirpath )
-    logMessage('verbose', 'latest.json symlinked to ynventory-%s.json' % timestamp)
+    os.symlink( 'ynventory-%s.json' % timestamp, '%s/ynventory-latest.json' % dirpath )
+    logMessage('verbose', 'ynventory-latest.json symlinked to ynventory-%s.json' % timestamp)
 
 def load_cache( dirpath ):
     cache = None
-    filepath = '%s/latest.json' % dirpath
+    filepath = '%s/ynventory-latest.json' % dirpath
     logMessage('verbose', 'Reading %s.' % filepath)
     if not os.path.isfile(filepath):
         logMessage("error", "%s could not be found." % filepath)
@@ -617,6 +631,36 @@ def load_cache( dirpath ):
         cache = {}
 
     return cache
+
+def merge_home( inventory, hostvarspath, groupvarspath ):
+    hostvars = inventory['_meta']['hostvars'].copy()
+    groupvars = inventory.copy()
+    del groupvars['_meta']
+    if hostvarspath is not None:
+        for path in get_yaml_filelist( [os.path.expanduser(hostvarspath)] ):
+            with open(path, 'r') as f:
+                if not os.access(path, os.R_OK):
+                    logMessage('warning', "Couldn't read %s. Skipping." % path)
+                else:
+                    try:
+                        hostvars = merge_dicts_recursively(hostvars, yaml.load(f))
+                    except:
+                        logMessage('warning', 'An error ocurred loading %s. Skipping.' % path)
+
+    if groupvarspath is not None:
+        for path in get_yaml_filelist( [os.path.expanduser(groupvarspath)] ):
+            with open(path, 'r') as f:
+                if not os.access(path, os.R_OK):
+                    logMessage('warning', "Couldn't read %s. Skipping." % path)
+                else:
+                    try:
+                        rawgroupvars = yaml.load(f)
+                    except:
+                        logMessage('warning', 'An error ocurred loading %s. Skipping.' % path)
+                        continue
+                    groupvars = merge_groups(groupvars, rawgroupvars, hostvars)
+    groupvars.update( { '_meta': { 'hostvars': hostvars } } )
+    return groupvars
 
 def load_config( filepath = None ):
     config = dict()
